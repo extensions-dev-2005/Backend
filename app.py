@@ -6,9 +6,9 @@ import traceback
 import logging
 import os
 import io
-import asyncio
 import tempfile
 from typing import Optional
+import asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +42,6 @@ async def initialize_groq_client():
     global groq_client
     
     try:
-        logger.info("Initializing Groq client...")
         from groq import Groq
         
         # Try different ways to get the API key
@@ -63,108 +62,134 @@ async def initialize_groq_client():
             groq_client = Groq(api_key=api_key)
             logger.info("Groq client initialized successfully")
         else:
-            logger.error("GROQ_API_KEY not found! Please set the environment variable.")
-            groq_client = None
+            logger.error("GROQ_API_KEY not found in environment variables")
+            raise Exception("GROQ_API_KEY not found")
             
     except Exception as e:
         logger.error(f"Failed to initialize Groq client: {e}")
-        logger.error(traceback.format_exc())
         groq_client = None
+        raise e
 
-def prepare_audio_for_groq(audio_bytes: bytes, filename: str = None) -> tuple:
+def validate_audio_file(content_type: str, file_size: int) -> tuple[bool, str]:
     """
-    Prepare audio data for Groq API - returns tuple format (filename, bytes)
+    Validate audio file type and size according to Groq API requirements
     """
-    try:
-        # Groq expects a tuple of (filename, file_content)
-        # Extract file extension from original filename or default to webm
-        if filename:
-            # Keep original extension
-            file_extension = os.path.splitext(filename)[1] or ".webm"
-            clean_filename = f"audio{file_extension}"
-        else:
-            clean_filename = "audio.webm"
-        
-        logger.info(f"Prepared audio tuple: {len(audio_bytes)} bytes, filename: {clean_filename}")
-        return (clean_filename, audio_bytes)
-        
-    except Exception as e:
-        logger.error(f"Error preparing audio for Groq: {e}")
-        raise
+    # Groq supported formats
+    supported_formats = [
+        "audio/flac", "audio/mp3", "audio/mp4", "audio/mpeg", 
+        "audio/mpga", "audio/m4a", "audio/ogg", "audio/wav", "audio/webm"
+    ]
+    
+    # Also check for common MIME type variations
+    supported_extensions = [
+        "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"
+    ]
+    
+    # Check file size (19.5MB max for Groq)
+    max_size = 19.5 * 1024 * 1024  # 19.5MB in bytes
+    if file_size > max_size:
+        return False, f"File size ({file_size / 1024 / 1024:.1f}MB) exceeds maximum limit (19.5MB)"
+    
+    # Check content type
+    if content_type in supported_formats:
+        return True, "Valid format"
+    
+    # Check if content type contains supported extension
+    for ext in supported_extensions:
+        if ext in content_type.lower():
+            return True, "Valid format"
+    
+    return False, f"Unsupported format: {content_type}. Supported formats: {', '.join(supported_extensions)}"
 
-def convert_audio_format(audio_bytes: bytes, target_format: str = "mp3") -> tuple:
+def convert_audio_if_needed(audio_bytes: bytes, content_type: str, filename: str) -> tuple[bytes, str]:
     """
-    Convert audio to a more compatible format using pydub if the original format fails
+    Convert audio to a supported format if needed using pydub
     """
     try:
         from pydub import AudioSegment
         
-        logger.info(f"Converting audio to {target_format} format...")
+        # If it's already a supported format, return as-is
+        supported_extensions = ["flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"]
         
-        # Try to load the audio with pydub
-        audio_segment = None
+        # Try to determine format from content type or filename
+        format_hint = None
+        if content_type:
+            for ext in supported_extensions:
+                if ext in content_type.lower():
+                    format_hint = ext
+                    break
         
-        # Try different format hints
-        formats_to_try = ["webm", "ogg", "mp4", "wav", None]  # None = auto-detect
+        if not format_hint and filename:
+            file_ext = filename.split('.')[-1].lower() if '.' in filename else None
+            if file_ext in supported_extensions:
+                format_hint = file_ext
         
-        for fmt in formats_to_try:
-            try:
-                if fmt is None:
-                    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes))
-                else:
-                    audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
-                logger.info(f"Successfully loaded audio with format: {fmt or 'auto-detect'}")
-                break
-            except Exception as fmt_error:
-                logger.debug(f"Format {fmt} failed: {fmt_error}")
-                continue
+        # If we have a supported format hint, try to use the audio as-is
+        if format_hint in supported_extensions:
+            return audio_bytes, format_hint
         
-        if audio_segment is None:
-            raise Exception("Could not load audio with any format")
+        # Otherwise, convert to WAV (widely supported)
+        logger.info(f"Converting audio from {content_type} to WAV")
         
-        # Export to target format
+        # Load audio
+        if format_hint:
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=format_hint)
+        else:
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
+        
+        # Convert to WAV
         output_buffer = io.BytesIO()
-        audio_segment.export(output_buffer, format=target_format)
+        audio.export(output_buffer, format="wav")
         converted_bytes = output_buffer.getvalue()
-        filename = f"converted_audio.{target_format}"
         
-        logger.info(f"Audio converted to {target_format}: {len(converted_bytes)} bytes")
-        return (filename, converted_bytes)
+        logger.info(f"Successfully converted audio to WAV. Size: {len(converted_bytes)} bytes")
+        return converted_bytes, "wav"
         
     except Exception as e:
         logger.error(f"Audio conversion failed: {e}")
-        raise
+        # Return original if conversion fails
+        return audio_bytes, "webm"
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting Nova.AI Backend...")
-    await initialize_groq_client()
-    logger.info("Backend startup completed")
+    try:
+        await initialize_groq_client()
+        logger.info("Backend startup completed successfully")
+    except Exception as e:
+        logger.error(f"Backend startup failed: {e}")
+        # Don't raise here to allow health checks to show the error
 
 # Health check endpoint
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     return HealthResponse(
-        status="healthy",
-        message="Nova.AI Backend is running",
+        status="healthy" if groq_client is not None else "degraded",
+        message="Nova.AI Backend is running" if groq_client is not None else "Groq client not initialized",
         models_loaded={
             "groq_client": groq_client is not None,
-            "whisper_via_groq": groq_client is not None
+            "whisper_api": groq_client is not None,
+            "text_generation": groq_client is not None
         }
     )
 
 # Root endpoint
 @app.get("/")
 async def root():
-    return {"message": "Nova.AI Backend API", "status": "running"}
+    return {
+        "message": "Nova.AI Backend API", 
+        "status": "running",
+        "version": "2.0.0",
+        "features": ["transcription", "summarization", "response_suggestions"]
+    }
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
     if groq_client is None:
         raise HTTPException(
-            status_code=503, 
-            detail="Groq client not available. Please check GROQ_API_KEY."
+            status_code=503,
+            detail="Groq client not available. Please check GROQ_API_KEY environment variable."
         )
     
     try:
@@ -172,107 +197,107 @@ async def transcribe(audio: UploadFile = File(...)):
         
         # Read audio data
         audio_bytes = await audio.read()
-        logger.info(f"Read {len(audio_bytes)} bytes from audio file")
+        file_size = len(audio_bytes)
         
-        # Validate audio data
-        if len(audio_bytes) == 0:
+        logger.info(f"Read {file_size} bytes from audio file")
+        
+        # Validate file
+        if file_size == 0:
             raise HTTPException(status_code=400, detail="Empty audio file")
         
-        if len(audio_bytes) > 25 * 1024 * 1024:  # 25MB limit (Groq's limit)
-            raise HTTPException(status_code=413, detail="Audio file too large (max 25MB)")
+        is_valid, validation_message = validate_audio_file(audio.content_type or "", file_size)
+        if not is_valid:
+            raise HTTPException(status_code=400, detail=validation_message)
         
-        # Prepare audio for Groq
-        audio_file = None
+        # Convert audio if needed
+        try:
+            processed_audio_bytes, audio_format = convert_audio_if_needed(
+                audio_bytes, 
+                audio.content_type or "", 
+                audio.filename or ""
+            )
+            logger.info(f"Audio processed successfully. Format: {audio_format}")
+        except Exception as conversion_error:
+            logger.warning(f"Audio conversion failed, using original: {conversion_error}")
+            processed_audio_bytes = audio_bytes
+            # Try to guess format from filename or default to webm
+            if audio.filename and '.' in audio.filename:
+                audio_format = audio.filename.split('.')[-1].lower()
+            else:
+                audio_format = "webm"
+        
+        # Create a temporary file for Groq API
+        with tempfile.NamedTemporaryFile(suffix=f'.{audio_format}', delete=False) as temp_file:
+            temp_file.write(processed_audio_bytes)
+            temp_file_path = temp_file.name
         
         try:
-            # First, try to use the audio as-is
-            logger.info("Attempting to use original audio format...")
-            audio_file = prepare_audio_for_groq(audio_bytes, audio.filename)
+            # Transcribe using Groq Whisper API
+            logger.info("Starting Groq Whisper transcription...")
             
-            # Test transcription with original format
-            logger.info("Starting transcription with Groq Whisper...")
-            result = groq_client.audio.transcriptions.create(
-                file=audio_file,
-                model="whisper-large-v3",
-                response_format="verbose_json"  # Get detailed response
-            )
-            
-            transcription_text = result.text if hasattr(result, 'text') else str(result)
-            
-        except Exception as original_error:
-            logger.warning(f"Original format failed: {original_error}")
-            
-            # Try converting to MP3 format
-            try:
-                logger.info("Converting audio to MP3 format...")
-                audio_file = convert_audio_format(audio_bytes, "mp3")
-                
-                logger.info("Retrying transcription with converted audio...")
-                result = groq_client.audio.transcriptions.create(
-                    file=audio_file,
+            with open(temp_file_path, "rb") as file:
+                transcription_response = groq_client.audio.transcriptions.create(
+                    file=(audio.filename or f"audio.{audio_format}", file.read()),
                     model="whisper-large-v3",
-                    response_format="verbose_json"
+                    response_format="verbose_json",
+                    temperature=0.0,  # For more consistent results
                 )
-                
-                transcription_text = result.text if hasattr(result, 'text') else str(result)
-                
-            except Exception as conversion_error:
-                logger.warning(f"MP3 conversion failed: {conversion_error}")
-                
-                # Try WAV format as final fallback
-                try:
-                    logger.info("Converting audio to WAV format...")
-                    audio_file = convert_audio_format(audio_bytes, "wav")
-                    
-                    logger.info("Final attempt with WAV format...")
-                    result = groq_client.audio.transcriptions.create(
-                        file=audio_file,
-                        model="whisper-large-v3",
-                        response_format="text"  # Fallback to simple text
-                    )
-                    
-                    transcription_text = result if isinstance(result, str) else result.text
-                    
-                except Exception as wav_error:
-                    logger.error(f"All audio formats failed. WAV error: {wav_error}")
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Could not process audio format. Original error: {str(original_error)}"
-                    )
-        
-        # Clean up transcription text
-        transcription_text = transcription_text.strip() if transcription_text else ""
-        
-        # Filter out common Whisper artifacts and noise
-        artifacts = [
-            "[Music]", "[Applause]", "[Laughter]", "[Noise]", 
-            "MBC 뉴스", "ご視聴ありがとうございました", "Thank you for watching",
-            "(music)", "(applause)", "(laughter)", "(noise)"
-        ]
-        
-        for artifact in artifacts:
-            transcription_text = transcription_text.replace(artifact, "").strip()
-        
-        # Remove extra whitespace
-        transcription_text = " ".join(transcription_text.split())
-        
-        logger.info(f"Transcription completed successfully: '{transcription_text[:100]}{'...' if len(transcription_text) > 100 else ''}'")
-        
-        return {"text": transcription_text}
+            
+            transcription_text = transcription_response.text.strip() if transcription_response.text else ""
+            
+            # Filter out common Whisper artifacts
+            artifacts = [
+                "[Music]", "[Applause]", "[Laughter]", "MBC 뉴스", 
+                "ご視聴ありがとうございました", "(Music)", "(Applause)",
+                "♪ Music ♪", "♪♪♪", "Thanks for watching!", "Thank you for watching!"
+            ]
+            
+            for artifact in artifacts:
+                transcription_text = transcription_text.replace(artifact, "").strip()
+            
+            # Remove multiple spaces
+            transcription_text = " ".join(transcription_text.split())
+            
+            logger.info(f"Transcription completed: '{transcription_text[:100]}{'...' if len(transcription_text) > 100 else ''}'")
+            
+            return {
+                "text": transcription_text,
+                "duration": getattr(transcription_response, 'duration', None),
+                "language": getattr(transcription_response, 'language', None)
+            }
+            
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to clean up temporary file: {cleanup_error}")
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected transcription error: {e}")
+        logger.error(f"Transcription error: {e}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        
+        # Provide more helpful error messages
+        error_detail = str(e)
+        if "rate_limit" in error_detail.lower():
+            error_detail = "API rate limit exceeded. Please try again in a moment."
+        elif "file_size" in error_detail.lower():
+            error_detail = "Audio file is too large. Maximum size is 19.5MB."
+        elif "invalid_request_error" in error_detail.lower():
+            error_detail = "Invalid audio format or corrupted file."
+        else:
+            error_detail = f"Transcription failed: {error_detail}"
+            
+        raise HTTPException(status_code=500, detail=error_detail)
 
 @app.post("/summarize")
 async def summarize(request: TextRequest):
     if groq_client is None:
         raise HTTPException(
-            status_code=503, 
-            detail="Groq client not available. Please check GROQ_API_KEY."
+            status_code=503,
+            detail="Groq client not available. Please check GROQ_API_KEY environment variable."
         )
     
     if not request.text or not request.text.strip():
@@ -282,30 +307,31 @@ async def summarize(request: TextRequest):
         logger.info(f"Summarizing text of length: {len(request.text)}")
         
         # Truncate text if too long (Groq has token limits)
-        max_chars = 6000  # More generous limit for Groq
+        max_chars = 8000  # Conservative limit for llama models
         text_to_summarize = request.text[:max_chars]
         if len(request.text) > max_chars:
             text_to_summarize += "... [text truncated]"
         
         messages = [
             {
-                "role": "system", 
-                "content": "You are a helpful assistant that creates concise, actionable summaries of meeting transcripts. Focus on key decisions, action items, and important discussion points. Provide a well-structured summary with clear bullet points when appropriate."
+                "role": "system",
+                "content": "You are a helpful assistant that creates concise, actionable summaries of meeting transcripts. Focus on key decisions, action items, and important discussion points. Structure your summary with clear sections when appropriate."
             },
             {
-                "role": "user", 
-                "content": f"Please summarize this meeting transcript, highlighting key decisions, action items, and important discussion points:\n\n{text_to_summarize}"
+                "role": "user",
+                "content": f"Summarize this meeting transcript in 2-3 paragraphs, highlighting key decisions and action items:\n\n{text_to_summarize}"
             }
         ]
         
-        result = groq_client.chat.completions.create(
+        response = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-70b-versatile",
             max_tokens=400,
-            temperature=0.3
+            temperature=0.3,
+            top_p=0.9
         )
         
-        summary = result.choices[0].message.content.strip()
+        summary = response.choices[0].message.content.strip()
         logger.info("Summary generated successfully")
         
         return {"summary": summary}
@@ -313,14 +339,21 @@ async def summarize(request: TextRequest):
     except Exception as e:
         logger.error(f"Summarization error: {e}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Summarization failed: {str(e)}")
+        
+        error_detail = str(e)
+        if "rate_limit" in error_detail.lower():
+            error_detail = "API rate limit exceeded. Please try again in a moment."
+        else:
+            error_detail = f"Summarization failed: {error_detail}"
+            
+        raise HTTPException(status_code=500, detail=error_detail)
 
 @app.post("/suggest_response")
 async def suggest_response(request: TextRequest):
     if groq_client is None:
         raise HTTPException(
-            status_code=503, 
-            detail="Groq client not available. Please check GROQ_API_KEY."
+            status_code=503,
+            detail="Groq client not available. Please check GROQ_API_KEY environment variable."
         )
     
     if not request.text or not request.text.strip():
@@ -330,28 +363,29 @@ async def suggest_response(request: TextRequest):
         logger.info(f"Generating response suggestion for text of length: {len(request.text)}")
         
         # Get last portion of transcript for context
-        max_chars = 4000
+        max_chars = 6000
         text_for_response = request.text[-max_chars:] if len(request.text) > max_chars else request.text
         
         messages = [
             {
-                "role": "system", 
-                "content": "You are a professional meeting assistant. Analyze the transcript to identify the most recent question, request, or discussion point that requires a response. Provide a brief, professional, and contextually appropriate response suggestion. If no clear question is present, suggest a relevant follow-up or clarifying question."
+                "role": "system",
+                "content": "You are a professional meeting assistant. Analyze the transcript to identify the most recent question, request, or discussion point that requires a response. Provide a brief, professional, and contextually appropriate response suggestion that directly addresses the query."
             },
             {
-                "role": "user", 
-                "content": f"Based on this meeting transcript, suggest a professional response to the most recent query or discussion point:\n\n{text_for_response}"
+                "role": "user",
+                "content": f"Based on this meeting transcript, suggest a professional response to the most recent query or discussion point that needs addressing:\n\n{text_for_response}"
             }
         ]
         
-        result = groq_client.chat.completions.create(
+        response = groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-70b-versatile",
             max_tokens=250,
-            temperature=0.4
+            temperature=0.4,
+            top_p=0.9
         )
         
-        suggestion = result.choices[0].message.content.strip()
+        suggestion = response.choices[0].message.content.strip()
         logger.info("Response suggestion generated successfully")
         
         return {"suggestion": suggestion}
@@ -359,99 +393,14 @@ async def suggest_response(request: TextRequest):
     except Exception as e:
         logger.error(f"Response suggestion error: {e}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Response suggestion failed: {str(e)}")
-
-@app.post("/transcribe_with_options")
-async def transcribe_with_options(
-    audio: UploadFile = File(...),
-    language: str = None,
-    temperature: float = 0.0
-):
-    """
-    Enhanced transcription endpoint with additional options
-    """
-    if groq_client is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Groq client not available. Please check GROQ_API_KEY."
-        )
-    
-    try:
-        logger.info(f"Processing audio with options - Language: {language}, Temperature: {temperature}")
         
-        # Read and validate audio
-        audio_bytes = await audio.read()
-        
-        if len(audio_bytes) == 0:
-            raise HTTPException(status_code=400, detail="Empty audio file")
-        
-        if len(audio_bytes) > 25 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Audio file too large (max 25MB)")
-        
-        # Prepare transcription parameters
-        transcription_params = {
-            "model": "whisper-large-v3",
-            "response_format": "json",  # Get more detailed response
-            "temperature": max(0.0, min(1.0, temperature))  # Ensure valid range
-        }
-        
-        if language:
-            transcription_params["language"] = language
-        
-        # Prepare audio
-        audio_file = prepare_audio_for_groq(audio_bytes, audio.filename)
-        transcription_params["file"] = audio_file
-        
-        try:
-            # Attempt transcription
-            result = groq_client.audio.transcriptions.create(**transcription_params)
+        error_detail = str(e)
+        if "rate_limit" in error_detail.lower():
+            error_detail = "API rate limit exceeded. Please try again in a moment."
+        else:
+            error_detail = f"Response suggestion failed: {error_detail}"
             
-            # Extract text and additional info
-            if isinstance(result, str):
-                transcription_text = result.strip()
-                response_data = {"text": transcription_text}
-            else:
-                # Handle verbose_json response with additional metadata
-                transcription_text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
-                response_data = {
-                    "text": transcription_text,
-                    "language": getattr(result, 'language', language),
-                    "duration": getattr(result, 'duration', None),
-                    "segments": getattr(result, 'segments', None)  # Word-level timestamps if available
-                }
-            
-            # Clean up transcription
-            artifacts = [
-                "[Music]", "[Applause]", "[Laughter]", "[Noise]", 
-                "(music)", "(applause)", "(laughter)", "(noise)"
-            ]
-            
-            for artifact in artifacts:
-                transcription_text = transcription_text.replace(artifact, "").strip()
-            
-            response_data["text"] = " ".join(transcription_text.split())
-            
-            logger.info("Enhanced transcription completed successfully")
-            return response_data
-            
-        except Exception as e:
-            # Fallback to format conversion
-            logger.warning(f"Direct transcription failed, trying format conversion: {e}")
-            
-            audio_file = convert_audio_format(audio_bytes, "mp3")
-            transcription_params["file"] = audio_file
-            
-            result = groq_client.audio.transcriptions.create(**transcription_params)
-            transcription_text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
-            
-            return {"text": " ".join(transcription_text.split())}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Enhanced transcription error: {e}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=error_detail)
 
 # Error handlers
 @app.exception_handler(Exception)
@@ -460,9 +409,10 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(traceback.format_exc())
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error occurred"}
+        content={"detail": "Internal server error occurred. Please try again."}
     )
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)

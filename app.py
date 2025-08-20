@@ -9,7 +9,7 @@ import io
 import asyncio
 import tempfile
 from typing import Optional
-import groq
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -71,25 +71,28 @@ async def initialize_groq_client():
         logger.error(traceback.format_exc())
         groq_client = None
 
-def prepare_audio_for_groq(audio_bytes: bytes, filename: str = None) -> io.BytesIO:
+def prepare_audio_for_groq(audio_bytes: bytes, filename: str = None) -> tuple:
     """
-    Prepare audio data for Groq API - convert to a supported format if needed
+    Prepare audio data for Groq API - returns tuple format (filename, bytes)
     """
     try:
-        # Groq supports various audio formats including webm, mp3, wav, etc.
-        # Let's first try to use the audio as-is
-        audio_buffer = io.BytesIO(audio_bytes)
-        audio_buffer.name = filename or "audio.webm"  # Set a filename for the buffer
-        audio_buffer.seek(0)  # Reset position to beginning
+        # Groq expects a tuple of (filename, file_content)
+        # Extract file extension from original filename or default to webm
+        if filename:
+            # Keep original extension
+            file_extension = os.path.splitext(filename)[1] or ".webm"
+            clean_filename = f"audio{file_extension}"
+        else:
+            clean_filename = "audio.webm"
         
-        logger.info(f"Prepared audio buffer: {len(audio_bytes)} bytes, filename: {audio_buffer.name}")
-        return audio_buffer
+        logger.info(f"Prepared audio tuple: {len(audio_bytes)} bytes, filename: {clean_filename}")
+        return (clean_filename, audio_bytes)
         
     except Exception as e:
         logger.error(f"Error preparing audio for Groq: {e}")
         raise
 
-def convert_audio_format(audio_bytes: bytes, target_format: str = "mp3") -> io.BytesIO:
+def convert_audio_format(audio_bytes: bytes, target_format: str = "mp3") -> tuple:
     """
     Convert audio to a more compatible format using pydub if the original format fails
     """
@@ -122,11 +125,11 @@ def convert_audio_format(audio_bytes: bytes, target_format: str = "mp3") -> io.B
         # Export to target format
         output_buffer = io.BytesIO()
         audio_segment.export(output_buffer, format=target_format)
-        output_buffer.seek(0)
-        output_buffer.name = f"converted_audio.{target_format}"
+        converted_bytes = output_buffer.getvalue()
+        filename = f"converted_audio.{target_format}"
         
-        logger.info(f"Audio converted to {target_format}: {len(output_buffer.getvalue())} bytes")
-        return output_buffer
+        logger.info(f"Audio converted to {target_format}: {len(converted_bytes)} bytes")
+        return (filename, converted_bytes)
         
     except Exception as e:
         logger.error(f"Audio conversion failed: {e}")
@@ -179,21 +182,22 @@ async def transcribe(audio: UploadFile = File(...)):
             raise HTTPException(status_code=413, detail="Audio file too large (max 25MB)")
         
         # Prepare audio for Groq
-        audio_buffer = None
+        audio_file = None
         
         try:
             # First, try to use the audio as-is
             logger.info("Attempting to use original audio format...")
-            audio_buffer = prepare_audio_for_groq(audio_bytes, audio.filename)
+            audio_file = prepare_audio_for_groq(audio_bytes, audio.filename)
             
             # Test transcription with original format
             logger.info("Starting transcription with Groq Whisper...")
-            transcription = groq_client.audio.transcriptions.create(
-                file=audio_buffer,
+            result = groq_client.audio.transcriptions.create(
+                file=audio_file,
                 model="whisper-large-v3",
-                language="en",  # Optional: specify language or remove for auto-detection
-                response_format="text"
+                response_format="verbose_json"  # Get detailed response
             )
+            
+            transcription_text = result.text if hasattr(result, 'text') else str(result)
             
         except Exception as original_error:
             logger.warning(f"Original format failed: {original_error}")
@@ -201,15 +205,16 @@ async def transcribe(audio: UploadFile = File(...)):
             # Try converting to MP3 format
             try:
                 logger.info("Converting audio to MP3 format...")
-                audio_buffer = convert_audio_format(audio_bytes, "mp3")
+                audio_file = convert_audio_format(audio_bytes, "mp3")
                 
                 logger.info("Retrying transcription with converted audio...")
-                transcription = groq_client.audio.transcriptions.create(
-                    file=audio_buffer,
+                result = groq_client.audio.transcriptions.create(
+                    file=audio_file,
                     model="whisper-large-v3",
-                    language="en",
-                    response_format="text"
+                    response_format="verbose_json"
                 )
+                
+                transcription_text = result.text if hasattr(result, 'text') else str(result)
                 
             except Exception as conversion_error:
                 logger.warning(f"MP3 conversion failed: {conversion_error}")
@@ -217,14 +222,16 @@ async def transcribe(audio: UploadFile = File(...)):
                 # Try WAV format as final fallback
                 try:
                     logger.info("Converting audio to WAV format...")
-                    audio_buffer = convert_audio_format(audio_bytes, "wav")
+                    audio_file = convert_audio_format(audio_bytes, "wav")
                     
                     logger.info("Final attempt with WAV format...")
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=audio_buffer,
+                    result = groq_client.audio.transcriptions.create(
+                        file=audio_file,
                         model="whisper-large-v3",
-                        response_format="text"
+                        response_format="text"  # Fallback to simple text
                     )
+                    
+                    transcription_text = result if isinstance(result, str) else result.text
                     
                 except Exception as wav_error:
                     logger.error(f"All audio formats failed. WAV error: {wav_error}")
@@ -234,11 +241,7 @@ async def transcribe(audio: UploadFile = File(...)):
                     )
         
         # Clean up transcription text
-        if isinstance(transcription, str):
-            transcription_text = transcription.strip()
-        else:
-            # Handle case where transcription might be an object
-            transcription_text = str(transcription).strip()
+        transcription_text = transcription_text.strip() if transcription_text else ""
         
         # Filter out common Whisper artifacts and noise
         artifacts = [
@@ -396,24 +399,25 @@ async def transcribe_with_options(
             transcription_params["language"] = language
         
         # Prepare audio
-        audio_buffer = prepare_audio_for_groq(audio_bytes, audio.filename)
-        transcription_params["file"] = audio_buffer
+        audio_file = prepare_audio_for_groq(audio_bytes, audio.filename)
+        transcription_params["file"] = audio_file
         
         try:
             # Attempt transcription
             result = groq_client.audio.transcriptions.create(**transcription_params)
             
-            # Extract text and additional info if available
+            # Extract text and additional info
             if isinstance(result, str):
                 transcription_text = result.strip()
                 response_data = {"text": transcription_text}
             else:
-                # Handle JSON response with additional metadata
+                # Handle verbose_json response with additional metadata
                 transcription_text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
                 response_data = {
                     "text": transcription_text,
                     "language": getattr(result, 'language', language),
-                    "duration": getattr(result, 'duration', None)
+                    "duration": getattr(result, 'duration', None),
+                    "segments": getattr(result, 'segments', None)  # Word-level timestamps if available
                 }
             
             # Clean up transcription
@@ -434,8 +438,8 @@ async def transcribe_with_options(
             # Fallback to format conversion
             logger.warning(f"Direct transcription failed, trying format conversion: {e}")
             
-            audio_buffer = convert_audio_format(audio_bytes, "mp3")
-            transcription_params["file"] = audio_buffer
+            audio_file = convert_audio_format(audio_bytes, "mp3")
+            transcription_params["file"] = audio_file
             
             result = groq_client.audio.transcriptions.create(**transcription_params)
             transcription_text = result.text.strip() if hasattr(result, 'text') else str(result).strip()

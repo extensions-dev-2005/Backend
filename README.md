@@ -222,4 +222,4 @@ For issues and support:
 ---
 
 **Version**: 2.0  
-**Last Updated**: December 2024
+**Last Updated**: August 2025

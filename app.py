@@ -20,7 +20,7 @@ app = FastAPI(title="Nova.AI Backend", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, specify your domain
-    allow_credentials=True,
+    allow_credentials=False,  # Changed to False to support wildcard origins without CORS conflicts
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -325,7 +325,7 @@ async def summarize(request: TextRequest):
         
         response = groq_client.chat.completions.create(
             messages=messages,
-            model="openai/gpt-oss-120b",
+            model="openai/gpt-oss-20b",
             max_tokens=400,
             temperature=0.3,
             top_p=0.9
@@ -379,7 +379,7 @@ async def suggest_response(request: TextRequest):
         
         response = groq_client.chat.completions.create(
             messages=messages,
-            model="openai/gpt-oss-120b",
+            model="openai/gpt-oss-20b",
             max_tokens=250,
             temperature=0.4,
             top_p=0.9

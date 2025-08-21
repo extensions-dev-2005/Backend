@@ -10,17 +10,45 @@ import tempfile
 from typing import Optional
 import asyncio
 import time
+from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Load environment variables
+load_dotenv()
+
+# Configure logging for production
+log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Nova.AI Backend", version="1.0.0")
+# Environment detection
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+DEBUG = ENVIRONMENT == "development"
 
-# Enhanced CORS middleware
+app = FastAPI(
+    title="Nova.AI Backend", 
+    version="2.0.1",
+    debug=DEBUG,
+    docs_url="/docs" if DEBUG else None,  # Disable docs in production for security
+    redoc_url="/redoc" if DEBUG else None
+)
+
+# Production-ready CORS middleware
+allowed_origins = [
+    "https://your-domain.com",  # Replace with your actual domain
+    "https://www.your-domain.com",
+    "http://localhost:3000",  # For development
+    "http://127.0.0.1:3000",
+]
+
+if DEBUG:
+    allowed_origins.append("*")  # Allow all in development
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins if not DEBUG else ["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -36,15 +64,23 @@ class TextRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     message: str
+    environment: str
     models_loaded: dict
 
-# Rate limiting (simple in-memory)
+# Rate limiting (simple in-memory) - Enhanced for production
 request_timestamps = {}
-RATE_LIMIT_WINDOW = 60  # 1 minute
-MAX_REQUESTS_PER_WINDOW = 30
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
+MAX_REQUESTS_PER_WINDOW = int(os.getenv("MAX_REQUESTS_PER_WINDOW", "30"))
+
+def get_client_id(request: Request) -> str:
+    """Get client identifier for rate limiting"""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 def check_rate_limit(client_id: str) -> bool:
-    """Simple rate limiting"""
+    """Enhanced rate limiting with cleanup"""
     now = time.time()
     
     if client_id not in request_timestamps:
@@ -64,42 +100,31 @@ def check_rate_limit(client_id: str) -> bool:
     request_timestamps[client_id].append(now)
     return True
 
-# Initialize Groq client
+# Initialize Groq client with retry logic
 async def initialize_groq_client():
     global groq_client
     
     try:
         from groq import Groq
         
-        # Try different ways to get the API key
-        api_key = None
-        
-        # Method 1: Environment variable
+        # Get API key from environment
         api_key = os.getenv("GROQ_API_KEY")
         
-        # Method 2: Google Colab userdata (if available)
         if not api_key:
-            try:
-                from google.colab import userdata
-                api_key = userdata.get("GROQ_API_KEY")
-            except:
-                pass
-        
-        if api_key:
-            groq_client = Groq(api_key=api_key)
-            
-            # Test the client with a simple request
-            test_response = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": "Hello"}],
-                model="llama-3.1-70b-versatile",
-                max_tokens=10
-            )
-            
-            logger.info("Groq client initialized and tested successfully")
-        else:
             logger.error("GROQ_API_KEY not found in environment variables")
             raise Exception("GROQ_API_KEY not found")
-            
+        
+        groq_client = Groq(api_key=api_key)
+        
+        # Test the client with a simple request
+        test_response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": "Test"}],
+            model="llama-3.1-70b-versatile",
+            max_tokens=5
+        )
+        
+        logger.info("Groq client initialized and tested successfully")
+        
     except Exception as e:
         logger.error(f"Failed to initialize Groq client: {e}")
         groq_client = None
@@ -116,7 +141,7 @@ def validate_audio_file(content_type: str, file_size: int) -> tuple[bool, str]:
         "flac", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "wav", "webm"
     ]
     
-    # Check file size (25MB max - increased from 19.5MB for better reliability)
+    # Check file size (25MB max - updated for better reliability)
     max_size = 25 * 1024 * 1024
     if file_size > max_size:
         return False, f"File size ({file_size / 1024 / 1024:.1f}MB) exceeds maximum limit (25MB)"
@@ -184,20 +209,20 @@ def convert_audio_if_needed(audio_bytes: bytes, content_type: str, filename: str
         
     except Exception as e:
         logger.error(f"Audio conversion failed: {e}")
-        # Return original if conversion fails
         return audio_bytes, "webm"
 
 # Startup event
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting Nova.AI Backend...")
+    logger.info(f"Starting Nova.AI Backend in {ENVIRONMENT} mode...")
     try:
         await initialize_groq_client()
         logger.info("Backend startup completed successfully")
     except Exception as e:
         logger.error(f"Backend startup failed: {e}")
+        # Don't raise here to allow health checks to show the error
 
-# Health check endpoint
+# Health check endpoint - Enhanced for production monitoring
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     groq_available = groq_client is not None
@@ -205,6 +230,7 @@ async def health_check():
     return HealthResponse(
         status="healthy" if groq_available else "degraded",
         message="All services operational" if groq_available else "Groq API unavailable - check GROQ_API_KEY",
+        environment=ENVIRONMENT,
         models_loaded={
             "groq_client": groq_available,
             "whisper_api": groq_available,
@@ -222,6 +248,7 @@ async def root():
         "message": "Nova.AI Backend API", 
         "status": "running",
         "version": "2.0.1",
+        "environment": ENVIRONMENT,
         "features": ["transcription", "summarization", "response_suggestions"],
         "health_endpoint": "/health"
     }
@@ -234,9 +261,9 @@ async def transcribe(request: Request, audio: UploadFile = File(...)):
             detail="Groq client not available. Please check GROQ_API_KEY environment variable."
         )
     
-    # Simple rate limiting
-    client_ip = request.client.host
-    if not check_rate_limit(client_ip):
+    # Rate limiting
+    client_id = get_client_id(request)
+    if not check_rate_limit(client_id):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Please try again in a minute."
@@ -299,9 +326,9 @@ async def transcribe(request: Request, audio: UploadFile = File(...)):
             artifacts = [
                 "[Music]", "[Applause]", "[Laughter]", 
                 "(Music)", "(Applause)", "(Laughter)",
-                "â™ª Music â™ª", "â™ªâ™ªâ™ª", 
+                "♪ Music ♪", "♪♪♪", 
                 "Thanks for watching!", "Thank you for watching!",
-                "MBC ë‰´ìŠ¤", "ã\"è¦–è´ã‚ã‚ŠãŒã¨ã†ã\"ã–ã„ã¾ã—ãŸ"
+                "MBC 뉴스", "ご視聴ありがとうございました"
             ]
             
             for artifact in artifacts:
@@ -360,8 +387,8 @@ async def summarize(request: Request, text_request: TextRequest):
         )
     
     # Rate limiting
-    client_ip = request.client.host
-    if not check_rate_limit(client_ip):
+    client_id = get_client_id(request)
+    if not check_rate_limit(client_id):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Please try again in a minute."
@@ -451,8 +478,8 @@ async def suggest_response(request: Request, text_request: TextRequest):
         )
     
     # Rate limiting
-    client_ip = request.client.host
-    if not check_rate_limit(client_ip):
+    client_id = get_client_id(request)
+    if not check_rate_limit(client_id):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Please try again in a minute."
@@ -584,4 +611,4 @@ async def global_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=DEBUG)

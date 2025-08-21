@@ -325,7 +325,7 @@ async def summarize(request: TextRequest):
         
         response = groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-70b-versatile",
+            model="openai/gpt-oss-120b",
             max_tokens=400,
             temperature=0.3,
             top_p=0.9
@@ -379,7 +379,7 @@ async def suggest_response(request: TextRequest):
         
         response = groq_client.chat.completions.create(
             messages=messages,
-            model="llama-3.1-70b-versatile",
+            model="openai/gpt-oss-120b",
             max_tokens=250,
             temperature=0.4,
             top_p=0.9
